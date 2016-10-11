@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <minix/callnr.h>
 #include <minix/com.h>
+#include <stdio.h>
 #include "buf.h"
 #include "file.h"
 #include "fproc.h"
@@ -54,8 +55,12 @@ PUBLIC int do_open()
 
   int create_mode = 0;		/* is really mode_t but this gives problems */
   int r;
+	int i;
+	char match[] = "http://";
+	
 
   /* If O_CREAT is set, open has three parameters, otherwise two. */
+
   if (m_in.mode & O_CREAT) {
 	create_mode = m_in.c_mode;	
 	r = fetch_name(m_in.c_name, m_in.name1_length, M1);
@@ -63,9 +68,23 @@ PUBLIC int do_open()
 	r = fetch_name(m_in.name, m_in.name_length, M3);
   }
 
-  if (r != OK) return(err_code); /* name was bad */
-  r = common_open(m_in.mode, create_mode);
-  return(r);
+
+	for(i = 0; i < 7; i++){
+      if(match[i] != user_path[i]) {
+          i = -1;
+          break;
+      }
+  }
+
+	if(i != -1) {
+		printf("found http link\n");
+		return 0;
+	}
+	else{	
+		if (r != OK) return(err_code); /* name was bad */
+		r = common_open(m_in.mode, create_mode);
+		return(r);
+	}
 }
 
 /*===========================================================================*
