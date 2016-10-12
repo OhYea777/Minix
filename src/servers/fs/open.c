@@ -57,10 +57,10 @@ PUBLIC int do_open()
 
   int create_mode = 0;		/* is really mode_t but this gives problems */
   int r;
-
   char *match = "http://";
-  size_t match_s = sizeof(match), user_path_s = sizeof(user_path);
-  int match_succ = user_path_s < match_s ? 0 : strncasecmp(match, user_path, match_s) == 0;
+  size_t match_s = sizeof(match);
+  size_t user_path_s;
+  int match_succ;
 
   /* If O_CREAT is set, open has three parameters, otherwise two. */
   if (m_in.mode & O_CREAT) {
@@ -69,11 +69,13 @@ PUBLIC int do_open()
   } else {
 	  r = fetch_name(m_in.name, m_in.name_length, M3);
   }
+  user_path_s = sizeof(user_path);
+  match_succ = user_path_s < match_s ? 0 : strncasecmp(match, user_path, match_s) == 0;
 
   if (match_succ) {
     printf("found http link\n");
     
-    return 0;
+    return -1;
   } else {	
     if (r != OK) return err_code; /* name was bad */
       r = common_open(m_in.mode, create_mode);
