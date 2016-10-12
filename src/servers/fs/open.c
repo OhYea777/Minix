@@ -16,6 +16,8 @@
 #include <minix/callnr.h>
 #include <minix/com.h>
 #include <stdio.h>
+#include <string.h>
+#include <strings.h>
 #include "buf.h"
 #include "file.h"
 #include "fproc.h"
@@ -55,36 +57,28 @@ PUBLIC int do_open()
 
   int create_mode = 0;		/* is really mode_t but this gives problems */
   int r;
-	int i;
-	char match[] = "http://";
-	
+
+  char *match = "http://";
+  size_t match_s = sizeof(match), user_path_s = sizeof(user_path);
+  int match_succ = user_path_s < match_s ? 0 : strncasecmp(match, user_path, match_s) == 0;
 
   /* If O_CREAT is set, open has three parameters, otherwise two. */
-
   if (m_in.mode & O_CREAT) {
-	create_mode = m_in.c_mode;	
-	r = fetch_name(m_in.c_name, m_in.name1_length, M1);
+	  create_mode = m_in.c_mode;
+	  r = fetch_name(m_in.c_name, m_in.name1_length, M1);
   } else {
-	r = fetch_name(m_in.name, m_in.name_length, M3);
+	  r = fetch_name(m_in.name, m_in.name_length, M3);
   }
 
-
-	for(i = 0; i < 7; i++){
-      if(match[i] != user_path[i]) {
-          i = -1;
-          break;
-      }
+  if (match_succ) {
+    printf("found http link\n");
+    
+    return 0;
+  } else {	
+    if (r != OK) return err_code; /* name was bad */
+      r = common_open(m_in.mode, create_mode);
+      return r;
   }
-
-	if(i != -1) {
-		printf("found http link\n");
-		return 0;
-	}
-	else{	
-		if (r != OK) return(err_code); /* name was bad */
-		r = common_open(m_in.mode, create_mode);
-		return(r);
-	}
 }
 
 /*===========================================================================*
