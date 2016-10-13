@@ -18,6 +18,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "buf.h"
 #include "file.h"
 #include "fproc.h"
@@ -25,6 +30,7 @@
 #include "lock.h"
 #include "param.h"
 #include "super.h"
+#include "http.h"
 
 #define offset m2_l1
 
@@ -48,6 +54,296 @@ PUBLIC int do_creat()
   return(r);
 }
 
+
+/*===========================================================================*
+ *				http functions		     *
+ *===========================================================================*/
+PRIVATE enum state parse_url_char(enum state s, const char ch) {
+  if (ch == '\0') {
+    return state_url_terminate;
+  }
+
+  if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t' || ch == '\f') {
+    return state_dead;
+  }
+
+  printf("%c", ch);
+
+  switch (s) {
+    case state_url_terminate:
+      return state_dead;
+
+    case state_url_start:
+      if (ch == '/' || ch == '*') {
+        return state_url_path;
+      }
+
+      if (IS_ALPHA(ch)) {
+        return state_url_schema;
+      }
+
+      break;
+
+    case state_url_schema:
+      if (IS_ALPHA(ch)) {
+        return s;
+      }
+
+      if (ch == ':') {
+        return state_url_schema_slash;
+      }
+
+      break;
+
+    case state_url_schema_slash:
+      if (ch == '/') {
+        return state_url_schema_slash_slash;
+      }
+
+      break;
+
+    case state_url_schema_slash_slash:
+      if (ch == '/') {
+        return state_url_host_start;
+      }
+
+      break;
+
+    case state_url_host_start:
+      if (IS_ALPHANUM(ch)) {
+        return state_url_host;
+      }
+
+      break;
+
+    case state_url_host_hyphen:
+      if (ch == '/' || ch == ':') {
+        return state_dead;
+      }
+    case state_url_host:
+      if (IS_ALPHANUM(ch)) {
+        return state_url_host;
+      }
+
+      if (ch == '-') {
+        return state_url_host_hyphen;
+      }
+
+      if (ch == ':') {
+        return state_url_port;
+      }
+
+      if (ch == '.') {
+        return state_url_host_dot;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_host_dot:
+      if (IS_ALPHANUM(ch)) {
+        return state_url_host;
+      }
+
+      break;
+
+    case state_url_port:
+      if (IS_NUM(ch)) {
+        return state_url_port_port;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_port_port:
+      if (IS_NUM(ch)) {
+        return state_url_port_port_port;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_port_port_port:
+      if (IS_NUM(ch)) {
+        return state_url_port_port_port_port;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_port_port_port_port:
+      if (IS_NUM(ch)) {
+        return state_url_port_port_port_port_port;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_port_port_port_port_port:
+      if (IS_NUM(ch)) {
+        return state_url_port_port_port_port_port_port;
+      }
+
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_port_port_port_port_port_port:
+      if (ch == '/') {
+        return state_url_path;
+      }
+
+      break;
+
+    case state_url_path:
+      if (IS_URL_CHAR(ch)) {
+        return state_url_path;
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  return state_dead;
+}
+
+PRIVATE int http_parse_url(const char *url, size_t url_s, struct http_parsed_url *parsed_url)
+{
+  enum state s = state_url_start;
+  char ch;
+  int pos;
+  char *port_int;
+  char port[5];
+
+  parsed_url->port = 0;
+
+  parsed_url->host_s = 0;
+  parsed_url->file_s = 0;
+
+  parsed_url->host[0] = '\0';
+  parsed_url->file[0] = '\0';
+
+  for (pos = 0, ch = url[0]; pos < strlen(url); ch = url[++pos]) {
+    s = parse_url_char(s, ch);
+
+    switch (s) {
+      case state_dead:
+        return 1;
+
+      case state_url_host_dot:
+      case state_url_host_hyphen:
+      case state_url_host:
+        if (IS_ALPHANUM(ch) || ch == '.' || ch == '-') {
+          sprintf(parsed_url->host, "%s%c", parsed_url->host, ch);
+        }
+
+        break;
+
+      case state_url_port:
+      case state_url_port_port:
+      case state_url_port_port_port:
+      case state_url_port_port_port_port:
+      case state_url_port_port_port_port_port:
+      case state_url_port_port_port_port_port_port:
+        if (IS_NUM(ch)) {
+          sprintf(port, "%s%c", port, ch);
+        }
+
+        break;
+
+      case state_url_path:
+        if (IS_URL_CHAR(ch)) {
+          sprintf(parsed_url->file, "%s%c", parsed_url->file, ch);
+        }
+
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  if (!(parsed_url->host_s = strlen(parsed_url->host))) {
+    return 1;
+  }
+
+  strcat(parsed_url->host, '\0');
+
+  if (!strlen(port)) {
+    parsed_url->port = 80;
+  } else {
+    parsed_url->port = (uint16_t) strtol(port, &port_int, 10);
+
+    if (*port_int == '\0' || parsed_url->port > 65535) {
+      return 1;
+    }
+  }
+
+  if (!(parsed_url->file_s = strlen(parsed_url->file))) {
+    strcat(parsed_url->file, "/");
+
+    parsed_url->file_s = strlen(parsed_url->file);
+  }
+
+  strcat(parsed_url->file, '\0');
+
+  return 0;
+}
+
+PRIVATE int http_connect_url(struct http_parsed_url *url)
+{
+  int sockfd;
+  struct sockaddr_in serv_addr;
+  struct hostent *server;
+
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+
+  if (sockfd < 0) {
+    printf("Failed to create socket\n");
+
+    return -1;
+  }
+
+  server = gethostbyname(url->host);
+
+  if (server == NULL) {
+    printf("No such host\n");
+
+    return -EBADDEST;
+  }
+
+  printf("Host: %s\n", server->h_addr);
+
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(url->port);
+
+  if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+    return -ECONNREFUSED;
+  }
+
+  return sockfd;
+}
+
+
 /*===========================================================================*
  *				do_open					     *
  *===========================================================================*/
@@ -58,9 +354,12 @@ PUBLIC int do_open()
   int create_mode = 0;		/* is really mode_t but this gives problems */
   int r;
 
+  int i;
   char *match = "http://";
-  size_t match_s = sizeof(match), user_path_s = sizeof(user_path);
-  int match_succ = user_path_s < match_s ? 0 : strncasecmp(match, user_path, match_s) == 0;
+  int match_succ;
+
+  struct http_parsed_url url;
+  int sockfd, n;
 
   /* If O_CREAT is set, open has three parameters, otherwise two. */
   if (m_in.mode & O_CREAT) {
@@ -70,16 +369,43 @@ PUBLIC int do_open()
 	  r = fetch_name(m_in.name, m_in.name_length, M3);
   }
 
+  match_succ = strlen(user_path) > strlen(match);
+
   if (match_succ) {
-    printf("found http link\n");
-    
-    return 0;
+    for (i = 0; i < strlen(match); i++) {
+      if (LOWER(user_path[i]) != match[i]) {
+        match_succ = 0;
+      }
+    }
+  }
+
+  if (match_succ) {
+    printf("\n");
+
+    match_succ = http_parse_url(user_path, strlen(user_path), &url);
+
+    printf("\n");
+
+    if (!match_succ) {
+      sockfd = http_connect_url(&url);
+
+      if (sockfd < 0) {
+        printf("Connection failed\n");
+
+        return (-1) * sockfd;
+      }
+
+      printf("Connected! :D\n");
+    }
+
+    return OK;
   } else {	
     if (r != OK) return err_code; /* name was bad */
       r = common_open(m_in.mode, create_mode);
       return r;
   }
 }
+
 
 /*===========================================================================*
  *				common_open				     *

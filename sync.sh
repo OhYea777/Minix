@@ -1,4 +1,3 @@
-#!/bin/bash
 FTPUSER=root
 FTPPASS=pass
 FTPPORT=2021
