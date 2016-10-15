@@ -11,6 +11,7 @@ EXTERN struct http_parsed_url
 
 PRIVATE const char *VALID_URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=%";
 
+#define TCP_DEVICE	"/dev/tcp"
 #define CR                  '\r'
 #define LF                  '\n'
 #define LOWER(c)            (unsigned char)(c | 0x20)
@@ -19,7 +20,7 @@ PRIVATE const char *VALID_URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno
 #define IS_ALPHANUM(c)      (IS_ALPHA(c) || IS_NUM(c))
 #define IS_URL_CHAR(c)      (strchr(VALID_URL_CHARS, c))
 
-EXTERN enum state
+EXTERN enum http_state
 {
   state_dead = 1,
 
