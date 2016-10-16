@@ -19,14 +19,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <lib.h>
-#include <net/gen/socket.h>
-#include <net/gen/in.h>
-#include <net/gen/nameser.h>
-#include <net/gen/netdb.h>
-#include <net/gen/resolv.h>
-#include <net/gen/inet.h>
 #include <netinet/in.h>
-#include <net/hton.h>
+#include <net/gen/socket.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include "file.h"
 #include "fproc.h"
 #include "inode.h"
@@ -35,8 +31,6 @@
 #include "super.h"
 #include "http.h"
 
-#define	MAXALIASES	35
-#define HOSTNAME_FILE "/etc/hostname.file"
 #define	PMODE		0666
 #define nil 0
 #define offset m2_l1
@@ -45,18 +39,12 @@
 #define isspace(c)	((unsigned) (c) <= ' ')
 #define	io_testflag(p,x)	((p)->_flags & (x))
 
-struct state _res;
-
-PRIVATE char HOSTS[]= _PATH_HOSTS;
-PRIVATE char *hosts = HOSTS;	/* Current hosts file. */
-PRIVATE FILE *hfp;		/* Open hosts file. */
-
 PRIVATE char mode_map[] = {R_BIT, W_BIT, R_BIT|W_BIT, 0};
 
 FORWARD _PROTOTYPE( int common_open, (int oflags, mode_t omode)		);
 FORWARD _PROTOTYPE( int pipe_open, (struct inode *rip,mode_t bits,int oflags));
 FORWARD _PROTOTYPE( struct inode *new_node, (char *path, mode_t bits,
-							zone_t z0)	);
+    zone_t z0)	);
 
 /*===========================================================================*
  *				do_creat				     *
@@ -73,8 +61,140 @@ PUBLIC int do_creat()
 
 
 /*===========================================================================*
+ *			Helper functions to call FS calls without doing it via server		     *
+ *===========================================================================*/
+PRIVATE int _open(char *_name, int flags)
+{
+  message m;
+
+  _loadname(_name, &m);
+  m.m3_i2 = flags;
+  m_in = m;
+
+  fetch_name(_name, strlen(_name), M3);
+
+  return do_open();
+}
+
+PRIVATE int _close(int _fd)
+{
+  message m;
+
+  m.m1_i1 = _fd;
+  m_in = m;
+
+  return do_close();
+}
+
+PRIVATE int _read(int _fd, char *_buffer, int _nbytes)
+{
+  message m;
+
+  m.m1_i1 = _fd;
+  m.m1_i2 = _nbytes;
+  m.m1_p1 = _buffer;
+  m_in = m;
+
+  return do_read();
+}
+
+PRIVATE int _creat(_CONST char *_name, _mnx_Mode_t _mode)
+{
+  message m;
+
+  m.m3_i2 = _mode;
+  _loadname(_name, &m);
+  m_in = m;
+
+  return do_creat();
+}
+
+PRIVATE off_t _lseek(int _fd, off_t _offset, int _whence)
+{
+  message m;
+
+  m.m2_i1 = _fd;
+  m.m2_l1 = _offset;
+  m.m2_i2 = _whence;
+  m_in = m;
+
+  if (do_lseek() < 0) return( (off_t) -1);
+  return( (off_t) m.m2_l1);
+}
+
+PRIVATE ssize_t _write(int _fd, _CONST void *_buffer, size_t _nbytes)
+{
+  message m;
+
+  m.m1_i1 = _fd;
+  m.m1_i2 = _nbytes;
+  m.m1_p1 = (char *) _buffer;
+  m_in = m;
+
+  return do_write();
+}
+
+PRIVATE int _fstat(int _fd, struct stat *_buffer)
+{
+  message m;
+
+  m.m1_i1 = _fd;
+  m.m1_p1 = (char *) _buffer;
+  m_in = m;
+
+  return do_fstat();
+}
+
+
+/*===========================================================================*
  *				http functions		     *
  *===========================================================================*/
+
+/*
+ * Converts a IPv4 string, XXX.XXX.XXX.XXX, to an integer used for connection.
+ */
+PRIVATE uint32_t parseIPV4string(char* ipAddress) {
+  unsigned int ipbytes[4];
+  long part;
+  int pos = 0;
+  const char delim[2] = ".";
+  char *bytes;
+
+  /* Cheat to convert 'localhost' hostname to ip since we are not actually resolving hosts */
+  if (strcasecmp(ipAddress, "localhost") == 0) {
+    ipAddress = "127.0.0.1";
+  }
+
+  bytes = strtok(ipAddress, delim);
+
+  while (bytes != NULL) {
+    if (pos > 3) {
+      return 0;
+    }
+
+    part = strtol(bytes, &bytes, 10);
+
+    if (part < 0 || part > 255){
+      return 0;
+    }
+
+    ipbytes[pos++] = (uint16_t) part;
+    bytes = strtok(NULL, delim);
+  }
+
+  if (pos != 4) {
+    return 0;
+  }
+
+  return ipbytes[3] | ipbytes[2] << 8 | ipbytes[1] << 16 | ipbytes[0] << 24;
+}
+
+/*
+ * Simple state machine for parsing URL's.
+ *
+ * Based on the previous state, it determines the validity of the next char in
+ * the URL and returns the corresponding state, otherwise returns state_dead.
+ */
 PRIVATE enum http_state parse_url_char(enum http_state s, const char ch) {
   if (ch == '\0') {
     return state_url_terminate;
@@ -83,8 +203,6 @@ PRIVATE enum http_state parse_url_char(enum http_state s, const char ch) {
   if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t' || ch == '\f') {
     return state_dead;
   }
-
-  printf("%c", ch);
 
   switch (s) {
     case state_url_terminate:
@@ -243,7 +361,13 @@ PRIVATE enum http_state parse_url_char(enum http_state s, const char ch) {
   return state_dead;
 }
 
-PRIVATE int http_parse_url(const char *url, size_t url_s, struct http_parsed_url *parsed_url)
+/*
+ * Tries to parse a given URL string into its separate segments: host, port, & filename
+ *
+ * If it is successful it will fill the given parsed_url with the segments and
+ * return 0, otherwise it will just return 1, however the parsed_url may be partially filled.
+ */
+PRIVATE int http_parse_url(const char *url, struct http_parsed_url *parsed_url)
 {
   enum http_state s = state_url_start;
   char ch;
@@ -326,704 +450,52 @@ PRIVATE int http_parse_url(const char *url, size_t url_s, struct http_parsed_url
   return 0;
 }
 
-PRIVATE int _open(char *_name, int flags)
-{
-  message m;
-
-  _loadname(_name, &m);
-  m.m3_i2 = flags;
-  m_in = m;
-
-
-  fetch_name(_name, strlen(_name), M3);
-
-  return do_open();
-}
-
-PRIVATE int _close(int _fd)
-{
-  message m;
-
-  m.m1_i1 = _fd;
-  m_in = m;
-
-  return do_close();
-}
-
-PRIVATE int _read(int _fd, char *_buffer, int _nbytes)
-{
-  message m;
-
-  m.m1_i1 = _fd;
-  m.m1_i2 = _nbytes;
-  m.m1_p1 = _buffer;
-  m_in = m;
-
-  return do_read();
-}
-
-PRIVATE int _creat(_CONST char *_name, _mnx_Mode_t _mode)
-{
-  message m;
-
-  m.m3_i2 = _mode;
-  _loadname(_name, &m);
-  m_in = m;
-
-  return do_creat();
-}
-
-PRIVATE off_t _lseek(int _fd, off_t _offset, int _whence)
-{
-  message m;
-
-  m.m2_i1 = _fd;
-  m.m2_l1 = _offset;
-  m.m2_i2 = _whence;
-  m_in = m;
-
-  if (do_lseek() < 0) return( (off_t) -1);
-  return( (off_t) m.m2_l1);
-}
-
-PUBLIC ssize_t _write(int _fd, _CONST void *_buffer, size_t _nbytes)
-{
-  message m;
-
-  m.m1_i1 = _fd;
-  m.m1_i2 = _nbytes;
-  m.m1_p1 = (char *) _buffer;
-
-  return do_write();
-}
-
-
-PRIVATE int _fclose(FILE *fp)
-{
-	register int i, retval = 0;
-
-	for (i=0; i<FOPEN_MAX; i++)
-		if (fp == __iotab[i]) {
-			__iotab[i] = 0;
-			break;
-		}
-	if (i >= FOPEN_MAX)
-		return EOF;
-	if (fflush(fp)) retval = EOF;
-	if (_close(fileno(fp))) retval = EOF;
-	if ( io_testflag(fp,_IOMYBUF) && fp->_buf )
-		free((void *)fp->_buf);
-	if (fp != stdin && fp != stdout && fp != stderr)
-		free((void *)fp);
-	return retval;
-}
-
-PRIVATE int _fflush(FILE *stream)
-{
-  int count, c1, i, retval = 0;
-
-  if (!stream) {
-    for(i= 0; i < FOPEN_MAX; i++)
-      if (__iotab[i] && _fflush(__iotab[i]))
-        retval = EOF;
-    return retval;
-  }
-
-  if (!stream->_buf
-      || (!io_testflag(stream, _IOREADING)
-          && !io_testflag(stream, _IOWRITING)))
-    return 0;
-  if (io_testflag(stream, _IOREADING)) {
-    /* (void) fseek(stream, 0L, SEEK_CUR); */
-    int adjust = 0;
-    if (io_testflag(stream, _IOFIFO)) {
-      /* Can't seek in a pipe. */
-      return 0;
-    }
-    if (stream->_buf && !io_testflag(stream,_IONBF))
-      adjust = -stream->_count;
-    stream->_count = 0;
-    if (_lseek(fileno(stream), (off_t) adjust, SEEK_CUR) == -1) {
-      stream->_flags |= _IOERR;
-      return EOF;
-    }
-    if (io_testflag(stream, _IOWRITE))
-      stream->_flags &= ~(_IOREADING | _IOWRITING);
-    stream->_ptr = stream->_buf;
-    return 0;
-  } else if (io_testflag(stream, _IONBF)) return 0;
-
-  if (io_testflag(stream, _IOREAD))		/* "a" or "+" mode */
-    stream->_flags &= ~_IOWRITING;
-
-  count = stream->_ptr - stream->_buf;
-  stream->_ptr = stream->_buf;
-
-  if ( count <= 0 )
-    return 0;
-
-  if (io_testflag(stream, _IOAPPEND)) {
-    if (_lseek(fileno(stream), 0L, SEEK_END) == -1) {
-      stream->_flags |= _IOERR;
-      return EOF;
-    }
-  }
-  c1 = _write(stream->_fd, (char *)stream->_buf, count);
-
-  stream->_count = 0;
-
-  if ( count == c1 )
-    return 0;
-
-  stream->_flags |= _IOERR;
-  return EOF;
-}
-
-PRIVATE int _fseek(FILE *stream, long int _offset, int _whence)
-{
-	int adjust = 0;
-	long pos;
-
-	stream->_flags &= ~(_IOEOF | _IOERR);
-	/* Clear both the end of file and error flags */
-
-	if (io_testflag(stream, _IOREADING)) {
-		if (_whence == SEEK_CUR
-		    && stream->_buf
-		    && !io_testflag(stream,_IONBF))
-			adjust = stream->_count;
-		stream->_count = 0;
-	} else if (io_testflag(stream,_IOWRITING)) {
-		_fflush(stream);
-	}
-
-	pos = _lseek(fileno(stream), _offset - adjust, _whence);
-	if (io_testflag(stream, _IOREAD) && io_testflag(stream, _IOWRITE))
-		stream->_flags &= ~(_IOREADING | _IOWRITING);
-
-	stream->_ptr = stream->_buf;
-	return ((pos == -1) ? -1 : 0);
-}
-
-PRIVATE FILE *_fopen(const char *_name, const char *_mode)
-{
-	register int i;
-	int rwmode = 0, rwflags = 0;
-	FILE *stream;
-	struct stat st;
-	int _fd, flags = 0;
-
-	for (i = 0; __iotab[i] != 0 ; i++)
-		if ( i >= FOPEN_MAX-1 )
-			return (FILE *)NULL;
-
-	switch(*_mode++) {
-	case 'r':
-		flags |= _IOREAD | _IOREADING;
-		rwmode = O_RDONLY;
-		break;
-	case 'w':
-		flags |= _IOWRITE | _IOWRITING;
-		rwmode = O_WRONLY;
-		rwflags = O_CREAT | O_TRUNC;
-		break;
-	case 'a':
-		flags |= _IOWRITE | _IOWRITING | _IOAPPEND;
-		rwmode = O_WRONLY;
-		rwflags |= O_APPEND | O_CREAT;
-		break;
-	default:
-		return (FILE *)NULL;
-	}
-
-	while (*_mode) {
-		switch(*_mode++) {
-		case 'b':
-			continue;
-		case '+':
-			rwmode = O_RDWR;
-			flags |= _IOREAD | _IOWRITE;
-			continue;
-		/* The sequence may be followed by additional characters */
-		default:
-			break;
-		}
-		break;
-	}
-
-	/* Perform a creat() when the file should be truncated or when
-	 * the file is opened for writing and the open() failed.
-	 */
-	if ((rwflags & O_TRUNC)
-	    || (((_fd = _open(_name, rwmode)) < 0)
-		    && (rwflags & O_CREAT))) {
-		if (((_fd = _creat(_name, PMODE)) > 0) && flags  | _IOREAD) {
-			(void) _close(_fd);
-      _fd = _open(_name, rwmode);
-		}
-
-	}
-
-	if (_fd < 0) return (FILE *)NULL;
-
-	if ( fstat( _fd, &st ) < 0 ) {
-		_close(_fd);
-		return (FILE *)NULL;
-	}
-
-	if ( st.st_mode & S_IFIFO ) flags |= _IOFIFO;
-
-	if (( stream = (FILE *) malloc(sizeof(FILE))) == NULL ) {
-		_close(_fd);
-		return (FILE *)NULL;
-	}
-
-	if ((flags & (_IOREAD | _IOWRITE))  == (_IOREAD | _IOWRITE))
-		flags &= ~(_IOREADING | _IOWRITING);
-
-	stream->_count = 0;
-	stream->_fd = _fd;
-	stream->_flags = flags;
-	stream->_buf = NULL;
-	__iotab[i] = stream;
-	return stream;
-}
-
-struct hostent *_gethostent(void)
-/* Return the next entry from the hosts files. */
-{
-  static char line[256];	/* One line in a hosts file. */
-  static ipaddr_t address;	/* IP address found first on the line. */
-  static char *names[16];	/* Pointers to the words on the line. */
-  static char *addrs[2]= {	/* List of IP addresses (just one.) */
-      (char *) &address,
-      nil,
-  };
-  static struct hostent host = {
-      nil,			/* h_name, will set to names[1]. */
-      names + 2,		/* h_aliases, the rest of the names. */
-      AF_INET,		/* h_addrtype */
-      sizeof(ipaddr_t),	/* Size of an address in the address list. */
-      addrs,			/* List of IP addresses. */
-  };
-  static char nexthosts[128];	/* Next hosts file to include. */
-  char *lp, **np;
-  int c;
-
-  for (;;) {
-    if (hfp == nil) {
-      /* No hosts file open, try to open the next one. */
-      if (hosts == 0) return nil;
-      if ((hfp= _fopen(hosts, "r")) == nil) { hosts= nil; continue; }
-    }
-
-    /* Read a line. */
-    lp= line;
-    while ((c= getc(hfp)) != EOF && c != '\n') {
-      if (lp < arraylimit(line)) *lp++= c;
-    }
-
-    /* EOF?  Then close and prepare for reading the next file. */
-    if (c == EOF) {
-      _fclose(hfp);
-      hfp= nil;
-      hosts= nil;
-      continue;
-    }
-
-    if (lp == arraylimit(line)) continue;
-    *lp= 0;
-
-    /* Break the line up in words. */
-    np= names;
-    lp= line;
-    for (;;) {
-      while (isspace(*lp) && *lp != 0) lp++;
-      if (*lp == 0 || *lp == '#') break;
-      if (np == arraylimit(names)) break;
-      *np++= lp;
-      while (!isspace(*lp) && *lp != 0) lp++;
-      if (*lp == 0) break;
-      *lp++= 0;
-    }
-
-    if (np == arraylimit(names)) continue;
-    *np= nil;
-
-    /* Special "include file" directive. */
-    if (np == names + 2 && strcmp(names[0], "include") == 0) {
-      _fclose(hfp);
-      hfp= nil;
-      hosts= nil;
-      if (strlen(names[1]) < sizeof(nexthosts)) {
-        strcpy(nexthosts, names[1]);
-        hosts= nexthosts;
-      }
-      continue;
-    }
-
-    /* At least two words, the first of which is an IP address. */
-    if (np < names + 2) continue;
-    if (!inet_aton(names[0], &address)) continue;
-    host.h_name= names[1];
-
-    return &host;
-  }
-}
-
-PRIVATE int _gethostname(char *buf, size_t len)
-{
-  int _fd;
-  int r;
-  char *nl;
-
-  if ((_fd= open(HOSTNAME_FILE, O_RDONLY)) < 0) return -1;
-
-  r= _read(_fd, buf, len);
-  _close(_fd);
-  if (r == -1) return -1;
-
-  buf[len-1]= '\0';
-  if ((nl= strchr(buf, '\n')) != NULL) *nl= '\0';
-  return 0;
-}
-
-PRIVATE FILE *servf = NULL;
-PRIVATE char line[BUFSIZ+1];
-PRIVATE struct servent serv;
-PRIVATE char *serv_aliases[MAXALIASES];
-int _serv_stayopen;
-
-PRIVATE void _setservent(int f)
-{
-  if (servf == NULL)
-    servf = _fopen(_PATH_SERVICES, "r" );
-  else {
-    _fseek(servf, 0L, SEEK_SET);
-    clearerr(servf);
-  }
-  _serv_stayopen |= f;
-}
-
-PRIVATE void _endservent()
-{
-  if (servf) {
-    _fclose(servf);
-    servf = NULL;
-  }
-  _serv_stayopen = 0;
-}
-
-PRIVATE char *_any(register char *cp, char *match)
-{
-  register char *mp, c;
-
-  while ((c = *cp)) {
-    for (mp = match; *mp; mp++)
-      if (*mp == c)
-        return (cp);
-    cp++;
-  }
-  return ((char *)0);
-}
-
-PRIVATE struct servent *_getservent()
-{
-	char *p;
-	register char *cp, **q;
-
-	if (servf == NULL && (servf = _fopen(_PATH_SERVICES, "r" )) == NULL)
-		return (NULL);
-again:
-	if ((p = fgets(line, BUFSIZ, servf)) == NULL)
-		return (NULL);
-	if (*p == '#')
-		goto again;
-	cp = _any(p, "#\n");
-	if (cp == NULL)
-		goto again;
-	*cp = '\0';
-	serv.s_name = p;
-	p = _any(p, " \t");
-	if (p == NULL)
-		goto again;
-	*p++ = '\0';
-	while (*p == ' ' || *p == '\t')
-		p++;
-	cp = _any(p, ",/");
-	if (cp == NULL)
-		goto again;
-	*cp++ = '\0';
-	serv.s_port = htons((u16_t)atoi(p));
-	serv.s_proto = cp;
-	q = serv.s_aliases = serv_aliases;
-	cp = _any(cp, " \t");
-	if (cp != NULL)
-		*cp++ = '\0';
-	while (cp && *cp) {
-		if (*cp == ' ' || *cp == '\t') {
-			cp++;
-			continue;
-		}
-		if (q < &serv_aliases[MAXALIASES - 1])
-			*q++ = cp;
-		cp = _any(cp, " \t");
-		if (cp != NULL)
-			*cp++ = '\0';
-	}
-	*q = NULL;
-	return (&serv);
-}
-
-PRIVATE struct servent *_getservbyname(const char *_name, const char *_proto)
-{
-	register struct servent *p;
-	register char **cp;
-
-	_setservent(_serv_stayopen);
-  printf("_1_");
-	while ((p = _getservent())) {
-		if (strcmp(_name, p->s_name) == 0)
-			goto gotname;
-		for (cp = p->s_aliases; *cp; cp++)
-			if (strcmp(_name, *cp) == 0)
-				goto gotname;
-		continue;
-gotname:
-		if (_proto == 0 || strcmp(p->s_proto, _proto) == 0)
-			break;
-	}
-  printf("_2_");
-	if (!_serv_stayopen)
-		_endservent();
-  printf("_3_");
-	return (p);
-}
-
-PRIVATE int _res_init()
-{
-  register FILE *fp;
-  register char *cp, **pp;
-  register int n;
-  char buf[BUFSIZ];
-  int haveenv = 0;
-  int havesearch = 0;
-  struct servent* servent;
-  u16_t nameserver_port;
-
-  /* Resolver state default settings */
-  _res.retrans = RES_TIMEOUT;	/* retransmition time interval */
-  _res.retry = 4;			/* number of times to retransmit */
-  _res.options = RES_DEFAULT;	/* options flags */
-  _res.nscount = 0;		/* number of name servers */
-  _res.defdname[0] = 0;		/* domain */
-
-  servent= _getservbyname("domain", NULL);
-  printf("_1");
-  if (!servent)
-  {
-    h_errno= NO_RECOVERY;
-    return -1;
-  }
-  nameserver_port= servent->s_port;
-
-  /* Allow user to override the local domain definition */
-  if ((cp = getenv("LOCALDOMAIN")) != NULL) {
-    (void)strncpy(_res.defdname, cp, sizeof(_res.defdname));
-    haveenv++;
-  }
-
-  printf("_2");
-
-  if ((fp = _fopen(_PATH_RESCONF, "r")) != NULL) {
-    /* read the config file */
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-      /* read default domain name */
-      if (!strncmp(buf, "domain", sizeof("domain") - 1)) {
-        if (haveenv)	/* skip if have from environ */
-          continue;
-        cp = buf + sizeof("domain") - 1;
-        while (*cp == ' ' || *cp == '\t')
-          cp++;
-        if ((*cp == '\0') || (*cp == '\n'))
-          continue;
-        (void)strncpy(_res.defdname, cp, sizeof(_res.defdname) - 1);
-        if ((cp = index(_res.defdname, '\n')) != NULL)
-          *cp = '\0';
-        havesearch = 0;
-        continue;
-      }
-      /* set search list */
-      if (!strncmp(buf, "search", sizeof("search") - 1)) {
-        if (haveenv)	/* skip if have from environ */
-          continue;
-        cp = buf + sizeof("search") - 1;
-        while (*cp == ' ' || *cp == '\t')
-          cp++;
-        if ((*cp == '\0') || (*cp == '\n'))
-          continue;
-        (void)strncpy(_res.defdname, cp, sizeof(_res.defdname) - 1);
-        if ((cp = index(_res.defdname, '\n')) != NULL)
-          *cp = '\0';
-        /*
-         * Set search list to be blank-separated strings
-         * on rest of line.
-         */
-        cp = _res.defdname;
-        pp = _res.dnsrch;
-        *pp++ = cp;
-        for (n = 0; *cp && pp < _res.dnsrch + MAXDNSRCH; cp++) {
-          if (*cp == ' ' || *cp == '\t') {
-            *cp = 0;
-            n = 1;
-          } else if (n) {
-            *pp++ = cp;
-            n = 0;
-          }
-        }
-        /* null terminate last domain if there are excess */
-        while (*cp != '\0' && *cp != ' ' && *cp != '\t')
-          cp++;
-        *cp = '\0';
-        *pp++ = 0;
-        havesearch = 1;
-        continue;
-      }
-      /* read nameservers to query */
-      if (!strncmp(buf, "nameserver", sizeof("nameserver") - 1) &&
-          _res.nscount < MAXNS) {
-        cp = buf + sizeof("nameserver") - 1;
-        while (*cp == ' ' || *cp == '\t')
-          cp++;
-        if ((*cp == '\0') || (*cp == '\n'))
-          continue;
-        if (!inet_aton(cp, &_res.nsaddr_list[_res.nscount]))
-          continue;
-        _res.nsport_list[_res.nscount]= nameserver_port;
-        _res.nscount++;
-        continue;
-      }
-    }
-    (void) _fclose(fp);
-  }
-  if (_res.nscount == 0) {
-    /* "localhost" is the default nameserver. */
-    _res.nsaddr_list[0]= htonl(0x7F000001);
-    _res.nsport_list[0]= nameserver_port;
-    _res.nscount= 1;
-  }
-  if (_res.defdname[0] == 0) {
-    if (_gethostname(buf, sizeof(_res.defdname)) == 0 &&
-        (cp = index(buf, '.')))
-      (void)strcpy(_res.defdname, cp + 1);
-  }
-
-  /* find components of local domain that might be searched */
-  if (havesearch == 0) {
-    pp = _res.dnsrch;
-    *pp++ = _res.defdname;
-    for (cp = _res.defdname, n = 0; *cp; cp++)
-      if (*cp == '.')
-        n++;
-    cp = _res.defdname;
-    for (; n >= LOCALDOMAINPARTS && pp < _res.dnsrch + MAXDFLSRCH;
-           n--) {
-      cp = index(cp, '.');
-      *pp++ = ++cp;
-    }
-    *pp++ = 0;
-  }
-  _res.options |= RES_INIT;
-  return (0);
-}
-
-
-struct hostent *gethostbyname(const char *_name)
-{
-  struct hostent *he;
-  char **pa;
-  char alias[256];
-  char *domain;
-
-  printf("1");
-  if ((_res.options & RES_INIT) == 0) {
-    _res_init();
-  }
-  printf("2");
-
-  while ((he= _gethostent()) != nil) {
-	  if (strcasecmp(he->h_name, _name) == 0) goto found;
-
-	  domain= strchr(he->h_name, '.');
-
-    for (pa= he->h_aliases; *pa != nil; pa++) {
-        strcpy(alias, *pa);
-
-        if (domain != nil && strchr(alias, '.') == nil) {
-          strcat(alias, domain);
-        }
-
-        if (strcasecmp(alias, _name) == 0) goto found;
-    }
-  }
-
-  found:
-    printf("3");
-    _res.options &= ~(RES_STAYOPEN | RES_USEVC);
-    _res_close();
-    printf("4");
-
-  return he;
-}
-
+/*
+ * Tries to connect to our parsed URL, if it is succesful it will return the File Descriptor
+ * for the socket, otherwise it will return -1.
+ */
 PRIVATE int http_connect_url(struct http_parsed_url *url)
 {
   int sockfd;
   struct sockaddr_in serv_addr;
-  struct hostent *server;
 
+  /* Breakdown of 'socket(AF_INET, SOCK_STREAM)' */
   sockfd = _open(TCP_DEVICE, O_RDWR);
 
   if (sockfd < 0) {
-    printf("Failed to create socket\n");
+    return -1;
+  }
+
+  serv_addr.sin_addr.s_addr = parseIPV4string(url->host);
+
+  if (serv_addr.sin_addr.s_addr <= 0) {
+    return -1;
+  }
+
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(url->port);
+
+  printf("Host: %u\n", (unsigned int) serv_addr.sin_addr.s_addr);
+
+  if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) == 0) {
+    printf("Failed to connect\n");
 
     return -1;
   }
 
-  printf("socket\n");
-
-  server = gethostbyname(url->host);
-
-  if (server == NULL) {
-    printf("No such host\n");
-
-    return -EBADDEST;
-  }
-
-  printf("Host: %s\n", inet_ntoa(serv_addr.sin_addr.s_addr));
-
-  return -1;
-
-  /* serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(url->port);
-
-  if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-    return -ECONNREFUSED;
-  } */
+  printf("Connected\n");
 
   return sockfd;
 }
 
-PRIVATE int http_request_file(int sockfd, char *file, size_t file_s)
+PRIVATE int http_get_file(int sockfd, char *file, size_t file_s)
 {
-
-
-  return sockfd;
+  return -1;
 }
 
 
 /*===========================================================================*
- *				do_open					     *
+ *			      	do_open	- modified to work with http files				           *
  *===========================================================================*/
 PUBLIC int do_open()
 {
@@ -1041,10 +513,10 @@ PUBLIC int do_open()
 
   /* If O_CREAT is set, open has three parameters, otherwise two. */
   if (m_in.mode & O_CREAT) {
-	  create_mode = m_in.c_mode;
-	  r = fetch_name(m_in.c_name, m_in.name1_length, M1);
+    create_mode = m_in.c_mode;
+    r = fetch_name(m_in.c_name, m_in.name1_length, M1);
   } else {
-	  r = fetch_name(m_in.name, m_in.name_length, M3);
+    r = fetch_name(m_in.name, m_in.name_length, M3);
   }
 
   match_succ = strlen(user_path) > strlen(match);
@@ -1058,39 +530,31 @@ PUBLIC int do_open()
   }
 
   if (match_succ) {
-    printf("\n");
-
-    match_succ = http_parse_url(user_path, strlen(user_path), &url);
+    match_succ = http_parse_url(user_path, &url);
 
     if (!match_succ) {
+      printf("Valid URL. Host: '%s', Port: %d, File: '%s'\n", url.host, url.port, url.file);
+
       sockfd = http_connect_url(&url);
 
       if (sockfd < 0) {
-        printf("Connection failed\n");
-
-        return (-1) * sockfd;
+        return -1;
       }
 
-      sockfd = http_request_file(sockfd, url.file, url.file_s);
+      sockfd = http_get_file(sockfd, url.file, url.file_s);
 
       if (sockfd < 0) {
-        printf("Request failed\n");
-
-        return (-1) * sockfd;
+        return -1;
       }
 
-      printf("Connected! :D\n");
-
       return sockfd;
-    } else {
-      printf("Connected! D: %d\n", url.port);
     }
 
     return -1;
-  } else {	
+  } else {
     if (r != OK) return err_code; /* name was bad */
-      r = common_open(m_in.mode, create_mode);
-      return r;
+    r = common_open(m_in.mode, create_mode);
+    return r;
   }
 }
 
